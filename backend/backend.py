@@ -58,7 +58,7 @@ async def task_excavate_chunk(turtle_ids: List[str], depth: int):
     agents = [swarm.get_turtle(tid) for tid in turtle_ids if swarm.get_turtle(tid)]
     if not agents: return
 
-    print(f"Task Started: Excavating with {len(agents)} turtles.")
+    print("Task Started: Excavating with {len(agents)} turtles.")
 
     for layer in range(depth):
         # Dig and Down (we just care if success is True/False)
