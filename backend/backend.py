@@ -1,170 +1,132 @@
 import asyncio
 import json
 import uuid
-from typing import Dict, Any, Callable, Awaitable
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
+from typing import Dict, List, Any
+from pydantic import BaseModel
 
 app = FastAPI()
 
-# --- THE TURTLE AGENT ---
-# This class wraps the WebSocket connection and makes it "awaitable"
+# --- SWARM CORE ---
+
+class ExcavateTask(BaseModel):
+    turtle_ids: List[str]
+    depth: int = 5
+
 class TurtleAgent:
+    """Represents a single Minecraft Turtle."""
     def __init__(self, turtle_id: str, websocket: WebSocket):
         self.id = turtle_id
         self.websocket = websocket
         self.pending_requests: Dict[str, asyncio.Future] = {}
 
-    async def _send_command(self, func: str, args: list = None) -> Any:
-        """Internal: Sends JSON to turtle and creates a Future to wait for the reply."""
+    async def exec(self, command: str) -> Any:
         request_id = str(uuid.uuid4())
-        payload = {
-            "id": request_id,
-            "func": func,
-            "args": args or []
-        }
-
-        # Create a "promise" that will be resolved later when the turtle replies
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
+        future = asyncio.get_running_loop().create_future()
         self.pending_requests[request_id] = future
 
-        await self.websocket.send_text(json.dumps(payload))
+        # This 'cmd' key must match 'data.cmd' in the Lua script above
+        await self.websocket.send_text(json.dumps({
+            "id": request_id,
+            "cmd": command
+    }))
 
-        # Wait here until the WebSocket handler calls set_result()
+        # Wait for the response to be 'resolved' by the listener loop
         return await future
 
-    # --- HIGH LEVEL API (These return values!) ---
-    async def dig(self):
-        return await self._send_command("turtle.dig")
-
-    async def forward(self):
-        return await self._send_command("turtle.forward")
-
-    async def turnLeft(self):
-        return await self._send_command("turtle.turnLeft")
-
-    async def inspect(self):
-        # This returns the ACTUAL block data (e.g., {name: "minecraft:stone"})
-        return await self._send_command("turtle.inspect")
-
-    def resolve_response(self, response: dict):
-        """Called when a JSON packet arrives from the turtle."""
+    def resolve(self, response: dict):
+        """Matches incoming response ID to the waiting future."""
         req_id = response.get("id")
         if req_id in self.pending_requests:
-            # Wake up the task that was waiting for this
             self.pending_requests[req_id].set_result(response)
             del self.pending_requests[req_id]
 
-# --- SWARM MANAGER ---
 class SwarmManager:
+    """Manages all connected turtles and task distribution."""
     def __init__(self):
-        self.agents: Dict[str, TurtleAgent] = {}
+        self.turtles: Dict[str, TurtleAgent] = {}
 
-    async def register(self, turtle_id: str, websocket: WebSocket):
-        agent = TurtleAgent(turtle_id, websocket)
-        self.agents[turtle_id] = agent
-        return agent
-
-    def remove(self, turtle_id: str):
-        if turtle_id in self.agents:
-            del self.agents[turtle_id]
-
-    def get_agent(self, turtle_id: str):
-        return self.agents.get(turtle_id)
+    def get_turtle(self, turtle_id: str) -> TurtleAgent:
+        return self.turtles.get(turtle_id)
 
 swarm = SwarmManager()
 
-# --- THE TASK LOGIC (Where the magic happens) ---
+# --- DATA DRIVEN TASKS ---
 
-# --- ADD THIS TO YOUR PYTHON ROUTES ---
+async def task_excavate_chunk(turtle_ids: List[str], depth: int):
+    agents = [swarm.get_turtle(tid) for tid in turtle_ids if swarm.get_turtle(tid)]
+    if not agents: return
 
-@app.post("/run-sync-task")
-async def run_sync():
-    t1 = swarm.get_agent("turtle1")
-    t2 = swarm.get_agent("turtle2")
+    print(f"Task Started: Excavating with {len(agents)} turtles.")
 
-    if t1 and t2:
-        # We use asyncio.create_task so the web request finishes immediately
-        # while the turtles keep working in the background.
-        asyncio.create_task(task_synced_dig(t1, t2))
-        return {"message": "Sync task started!"}
-    return {"message": "Missing turtles!", "t1": bool(t1), "t2": bool(t2)}, 400
+    for layer in range(depth):
+        # Dig and Down (we just care if success is True/False)
+        await asyncio.gather(*(a.exec("turtle.digDown()") for a in agents))
+        await asyncio.gather(*(a.exec("turtle.down()") for a in agents))
 
-async def task_synced_dig(t1: TurtleAgent, t2: TurtleAgent):
-    """
-    Task: Two turtles dig together.
-    We wait for BOTH to finish one step before starting the next.
-    """
-    print(f"Starting sync dig with {t1.id} and {t2.id}")
+        # Inspect returns the block table in the 'data' field
+        inspections = await asyncio.gather(*(a.exec("turtle.inspectDown()") for a in agents))
 
-    for _ in range(3):
-        # Run both forwards in parallel!
-        # This sends commands to both immediately, then waits for both replies.
-        results = await asyncio.gather(t1.forward(), t2.forward())
+        for i, report in enumerate(inspections):
+            # We look at 'data' now because 'result' is just the boolean True
+            block_info = report.get("data")
+            block_name = "air"
 
-        success1 = results[0].get("success")
-        success2 = results[1].get("success")
+            if isinstance(block_info, dict):
+                block_name = block_info.get("name", "unknown")
 
-        print(f"Step status: {t1.id}={success1}, {t2.id}={success2}")
+            print(f"Layer {layer} | {agents[i].id} reports block: {block_name}")
 
-        # Logic: If T1 hits a block, ask T2 to inspect its own surroundings
-        if not success1:
-            print(f"{t1.id} blocked! Asking {t2.id} to check block data...")
-            data = await t2.inspect()
-            print(f"{t2.id} sees: {data.get('result')}")
-
-async def task_finder(scout: TurtleAgent):
-    """
-    Task: Scout moves until it finds a specific block type.
-    """
-    print(f"{scout.id} starts scouting...")
-    while True:
-        # Ask turtle what is in front
-        response = await scout.inspect()
-        block_data = response.get("result") # Lua returns {name="minecraft:stone", ...}
-
-        if block_data and block_data.get("name") == "minecraft:diamond_ore":
-            print("DIAMOND FOUND! Stopping.")
-            break
-
-        # Not found? Move and try again
-        await scout.dig()
-        await scout.forward()
-
-# --- WEBSOCKET ENDPOINTS ---
+# --- API ENDPOINTS ---
 
 @app.websocket("/ws/turtle/{turtle_id}")
 async def turtle_endpoint(websocket: WebSocket, turtle_id: str):
     await websocket.accept()
-    agent = await swarm.register(turtle_id, websocket)
-    print(f"Agent {turtle_id} online.")
+    agent = TurtleAgent(turtle_id, websocket)
+    swarm.turtles[turtle_id] = agent
+    print(f"Turtle '{turtle_id}' joined the swarm.")
 
     try:
         while True:
-            data_str = await websocket.receive_text()
-            data = json.loads(data_str)
-            # Route the response to the specific Future waiting for it
-            agent.resolve_response(data)
-
+            # Listen for responses from the turtle
+            data = await websocket.receive_json()
+            agent.resolve(data)
     except WebSocketDisconnect:
-        swarm.remove(turtle_id)
-        print(f"Agent {turtle_id} offline.")
+        del swarm.turtles[turtle_id]
+        print(f"Turtle '{turtle_id}' left.")
+
+@app.post("/tasks/excavate")
+async def trigger_excavate(task: ExcavateTask): # Use the model here
+    # Access data via task.turtle_ids and task.depth
+    asyncio.create_task(task_excavate_chunk(task.turtle_ids, task.depth))
+    return {"status": "Task dispatched to swarm", "turtles": task.turtle_ids}
+
+# --- DASHBOARD ---
 
 @app.get("/")
 async def get():
-    return HTMLResponse(content=html_content) # Use same HTML as before
-
-# Trigger tasks via simple HTTP (for testing)
-@app.get("/start/sync")
-async def start_sync_task():
-    t1 = swarm.get_agent("turtle1")
-    t2 = swarm.get_agent("turtle2")
-    if t1 and t2:
-        # Fire and forget the task in the background
-        asyncio.create_task(task_synced_dig(t1, t2))
-        return {"status": "Task started"}
-    return {"error": "Need both turtles connected"}
+    return HTMLResponse("""
+    <html>
+        <head><title>Swarm Control</title></head>
+        <body style="font-family:sans-serif; background:#121212; color:white; padding:20px;">
+            <h1>Turtle Swarm Dashboard</h1>
+            <div id="status">Waiting for turtles...</div>
+            <hr>
+            <button onclick="runTask()" style="padding:10px; background:green; color:white;">Start 2-Turtle Sync Dig</button>
+            <script>
+                async function runTask() {
+                    const res = await fetch('/tasks/excavate', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({turtle_ids: ['turtle1', 'turtle2'], depth: 3})
+                    });
+                    alert("Task Dispatched!");
+                }
+            </script>
+        </body>
+    </html>
+    """)
 
 if __name__ == "__main__":
     import uvicorn
