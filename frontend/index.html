@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<body>
+<h2>Turtle Control</h2>
+<input type="text" id="tId" value="turtle1">
+<button onclick="send('turtle.forward()')">Forward</button>
+<button onclick="send('turtle.back()')">Back</button>
+<button onclick="send('turtle.turnLeft()')">Left</button>
+<button onclick="send('turtle.turnRight()')">Right</button>
+<button onclick="send('turtle.dig()')">Dig</button>
+<pre id="log"></pre>
+
+<script>
+    const ws = new WebSocket("ws://localhost:8000/ws/dashboard");
+    ws.onmessage = (e) => {
+        document.getElementById('log').innerText += e.data + "\n";
+    };
+    function send(cmd) {
+        const id = document.getElementById('tId').value;
+        ws.send(JSON.stringify({target: id, cmd: cmd}));
+    }
+</script>
+</body>
+</html>
