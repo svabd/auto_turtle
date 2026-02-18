@@ -1,34 +1,43 @@
-local turtle_id = "turtle1"
-local url = "ws://10.0.0.84:8000/ws/turtle/" .. turtle_id
-
-print("Connecting to: " .. url)
-local ws, err = http.websocket(url)
-
-if not ws then
-    error("Could not connect: " .. tostring(err))
-end
-
-print("Connected as " .. turtle_id)
+local turtle_id = "turtle1" -- Change to turtle2 for the second one
+local url = "ws://192.168.1.XX:8000/ws/turtle/" .. turtle_id
+local ws = http.websocket(url)
 
 while true do
-    local cmd = ws.receive()
-    if not cmd then break end
+    local msg = ws.receive()
+    if not msg then break end
 
-    print("Executing: " .. cmd)
+    local request = textutils.unserializeJSON(msg)
+    local funcName = request.func
+    local args = request.args
+    local reqId = request.id
 
-    -- Execute the string as Lua code
-    local func, loadErr = load("return " .. cmd)
-    if func then
-        local success, result = pcall(func)
+    -- Dynamically call the function (e.g., turtle.dig)
+    -- We map string "turtle.dig" to the actual function _G["turtle"]["dig"]
+    local parts = {}
+    for part in string.gmatch(funcName, "[^.]+") do
+        table.insert(parts, part)
+    end
+
+    local func = _G
+    for _, part in ipairs(parts) do
+        if func then func = func[part] end
+    end
+
+    if type(func) == "function" then
+        -- Call function with unpacked arguments
+        local status, result = pcall(func, table.unpack(args))
+
+        -- Send back result WITH the Request ID
         ws.send(textutils.serializeJSON({
-            success = success,
+            id = reqId,
+            success = status,
             result = result
         }))
     else
         ws.send(textutils.serializeJSON({
+            id = reqId,
             success = false,
-            error = loadErr
+            error = "Function not found"
         }))
     end
 end
-ws.close()
