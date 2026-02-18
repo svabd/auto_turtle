@@ -1,43 +1,54 @@
-local turtle_id = "turtle1" -- Change to turtle2 for the second one
-local url = "ws://192.168.1.XX:8000/ws/turtle/" .. turtle_id
-local ws = http.websocket(url)
+local turtle_id = "turtle1" -- Change this for each turtle
+local server_url = "ws://10.0.0.84:8000/ws/turtle/" .. turtle_id
+
+print("Connecting to: " .. server_url)
+local ws, err = http.websocket(server_url)
+
+if not ws then
+    error("Connection failed: " .. tostring(err))
+end
+
+print("Connected! Waiting for Task Objects...")
 
 while true do
-    local msg = ws.receive()
-    if not msg then break end
-
-    local request = textutils.unserializeJSON(msg)
-    local funcName = request.func
-    local args = request.args
-    local reqId = request.id
-
-    -- Dynamically call the function (e.g., turtle.dig)
-    -- We map string "turtle.dig" to the actual function _G["turtle"]["dig"]
-    local parts = {}
-    for part in string.gmatch(funcName, "[^.]+") do
-        table.insert(parts, part)
+    local message = ws.receive()
+    if not message then
+        print("Connection lost.")
+        break
     end
 
-    local func = _G
-    for _, part in ipairs(parts) do
-        if func then func = func[part] end
-    end
+    local data = textutils.unserializeJSON(message)
 
-    if type(func) == "function" then
-        -- Call function with unpacked arguments
-        local status, result = pcall(func, table.unpack(args))
+    if data and data.cmd then
+        local reqId = data.id -- Capture the ID from Python
+        print("Executing: " .. data.cmd)
 
-        -- Send back result WITH the Request ID
+        -- load() handles the full command string like "turtle.forward()"
+        local func, loadErr = load("return " .. data.cmd)
+
+        local success, actionSuccess, actionData
+        if func then
+            -- We no longer need table.unpack(args) because
+            -- the arguments are already inside the 'data.cmd' string.
+            local results = { pcall(func) }
+            success = results[1]       -- pcall status
+            actionSuccess = results[2] -- turtle result (true/false)
+            actionData = results[3]    -- extra data (block info)
+        else
+            success = false
+            actionData = loadErr
+        end
+
+        -- Send the response back to Python
         ws.send(textutils.serializeJSON({
             id = reqId,
-            success = status,
-            result = result
+            success = success,
+            result = actionSuccess,
+            data = actionData
         }))
     else
-        ws.send(textutils.serializeJSON({
-            id = reqId,
-            success = false,
-            error = "Function not found"
-        }))
+        print("Received malformed data.")
     end
 end
+
+ws.close()
